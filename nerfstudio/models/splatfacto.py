@@ -167,6 +167,14 @@ class SplatfactoModelConfig(ModelConfig):
     mcmc_scale_reg: float = 0.01
     """Regularization term for scale in MCMC strategy. Only enabled when using MCMC strategy"""
 
+    # --- 开始新增配置项 ---
+    use_feature_regularization: bool = False
+    """是否启用辅助特征及其正则化。设置为 True 以激活双通道渲染和正则化损失。"""
+    feature_dim: int = 8
+    """辅助特征向量的维度。"""
+    regularizer_type: Literal["dino", "vgg"] = "dino"
+    """选择使用的正则化器类型 (将在第3、4周具体实现损失)。"""
+    # --- 新增配置项结束 ---
 
 class SplatfactoModel(Model):
     """Nerfstudio's implementation of Gaussian Splatting
@@ -294,6 +302,33 @@ class SplatfactoModel(Model):
             raise ValueError(f"""Splatfacto does not support strategy {self.config.strategy}
                              Currently, the supported strategies include default and mcmc.""")
 
+        # ================== 开始新增代码 ==================
+        # 如果配置中启用了特征正则化，则初始化辅助特征参数
+        if self.config.use_feature_regularization:
+            CONSOLE.print(
+                f"[bold yellow]✨ Initializing Auxiliary Features with dimension: {self.config.feature_dim}")
+            # 使用与 means 相同的 num_points
+            # 注意：如果 populate_modules 在 __init__ 之后被调用，需要确保 num_points 可访问
+            # 一个更稳妥的方式是在 populate_modules 中进行初始化
+            # 这里我们假设 __init__ 中 num_points 已经确定
+            self.aux_features = torch.nn.Parameter(
+                torch.randn(num_points, self.config.feature_dim)
+            )
+            # 将 aux_features 添加到 gauss_params 以便优化器能找到它
+            self.gauss_params["aux_features"] = self.aux_features
+        else:
+            self.aux_features = None  # 设置为 None 以便后续判断
+
+        # 可以在这里预加载 DINO 或 VGG 模型 (第 3、4 周添加)
+        # if self.config.use_feature_regularization:
+        #     if self.config.regularizer_type == "dino":
+        #         # self.dino_model = ... load dino model ...
+        #         pass
+        #     elif self.config.regularizer_type == "vgg":
+        #         # self.style_loss = ... load vgg and init StyleLoss ...
+        #         pass
+        # ================== 新增代码结束 ==================
+
     @property
     def colors(self):
         if self.config.sh_degree > 0:
@@ -412,6 +447,13 @@ class SplatfactoModel(Model):
     def get_gaussian_param_groups(self) -> Dict[str, List[Parameter]]:
         # Here we explicitly use the means, scales as parameters so that the user can override this function and
         # specify more if they want to add more optimizable params to gaussians.
+
+        param_names = ["means", "scales", "quats", "features_dc", "features_rest", "opacities"]
+        # 如果启用了正则化并且 aux_features 已初始化，则将其加入优化列表
+        if self.config.use_feature_regularization and "aux_features" in self.gauss_params:
+            param_names.append("aux_features")
+        return {name: [self.gauss_params[name]] for name in param_names if name in self.gauss_params}
+
         return {
             name: [self.gauss_params[name]]
             for name in ["means", "scales", "quats", "features_dc", "features_rest", "opacities"]
@@ -519,6 +561,11 @@ class SplatfactoModel(Model):
             features_rest_crop = self.features_rest[crop_ids]
             scales_crop = self.scales[crop_ids]
             quats_crop = self.quats[crop_ids]
+            # --- 新增：如果启用了正则化，并且 aux_features 存在，也要裁剪 ---
+            if self.config.use_feature_regularization and self.aux_features is not None:
+                aux_features_crop = self.aux_features[crop_ids]
+            else:
+                aux_features_crop = None  # 保持一致性
         else:
             opacities_crop = self.opacities
             means_crop = self.means
@@ -526,6 +573,11 @@ class SplatfactoModel(Model):
             features_rest_crop = self.features_rest
             scales_crop = self.scales
             quats_crop = self.quats
+            # --- 新增：如果启用了正则化，并且 aux_features 存在 ---
+            if self.config.use_feature_regularization and self.aux_features is not None:
+                aux_features_crop = self.aux_features
+            else:
+                aux_features_crop = None  # 保持一致性
 
         colors_crop = torch.cat((features_dc_crop[:, None, :], features_rest_crop), dim=1)
 
@@ -552,7 +604,7 @@ class SplatfactoModel(Model):
             colors_crop = torch.sigmoid(colors_crop).squeeze(1)  # [N, 1, 3] -> [N, 3]
             sh_degree_to_use = None
 
-        render, alpha, self.info = rasterization(  # type: ignore[reportPossiblyUnboundVariable]
+        render_rgb_depth, alpha, info_dict = rasterization(  # type: ignore[reportPossiblyUnboundVariable]
             means=means_crop,
             quats=quats_crop,  # rasterization does normalization internally
             scales=torch.exp(scales_crop),
@@ -573,6 +625,8 @@ class SplatfactoModel(Model):
             # set some threshold to disregrad small gaussians for faster rendering.
             # radius_clip=3.0,
         )
+        self.info = info_dict  # 保存 info 用于反向传播策略
+
         if self.training:
             self.strategy.step_pre_backward(
                 self.gauss_params, self.optimizers, self.strategy_state, self.step, self.info
@@ -580,7 +634,7 @@ class SplatfactoModel(Model):
         alpha = alpha[:, ...]
 
         background = self._get_background_color()
-        rgb = render[:, ..., :3] + (1 - alpha) * background
+        rgb = render_rgb_depth[:, ..., :3] + (1 - alpha) * background
         rgb = torch.clamp(rgb, 0.0, 1.0)
 
         # apply bilateral grid
@@ -589,20 +643,57 @@ class SplatfactoModel(Model):
                 rgb = self._apply_bilateral_grid(rgb, camera.metadata["cam_idx"], H, W)
 
         if render_mode == "RGB+ED":
-            depth_im = render[:, ..., 3:4]
+            depth_im = render_rgb_depth[:, ..., 3:4]
+            # 处理 alpha 为 0 的区域，避免 NaN 或 inf
+            depth_im = torch.where(alpha > 1e-6, depth_im / (alpha + 1e-6), torch.zeros_like(depth_im))
             depth_im = torch.where(alpha > 0, depth_im, depth_im.detach().max()).squeeze(0)
         else:
             depth_im = None
 
+        # ================== 核心修改：第二次渲染调用 ==================
+        rendered_features = None  # 初始化为 None
+        # 条件：必须是训练阶段，配置启用，且 aux_features_crop 存在
+        if self.training and self.config.use_feature_regularization and aux_features_crop is not None:
+            CONSOLE.print("[bold cyan]✨ Performing 2nd Rendering Pass (Aux Features)...")
+            # 使用相同的几何参数，但将 'colors' 替换为我们的辅助特征
+            # 关键：sh_degree 必须为 None，render_mode 设为 'RGB'
+            rendered_features_map, _, _ = rasterization(  # 只需要第一个返回值
+                means=means_crop,
+                quats=quats_crop,
+                scales=torch.exp(scales_crop),
+                opacities=torch.sigmoid(opacities_crop).squeeze(-1),
+                colors=aux_features_crop,  # <-- 传入裁剪后的辅助特征
+                viewmats=viewmat,
+                Ks=K,
+                width=W,
+                height=H,
+                packed=False,
+                render_mode="RGB",  # 只渲染通道值
+                sh_degree=None,  # <-- 关键！必须为 None
+                sparse_grad=False,
+                absgrad=False,  # 特征渲染通常不需要 absgrad
+                rasterize_mode=self.config.rasterize_mode,
+            )
+            rendered_features = rendered_features_map.squeeze(0)  # [H, W, feature_dim]
+            CONSOLE.print(f"[bold cyan]✅ Auxiliary Features Rendered. Shape: {rendered_features.shape}")
+        # ================== 核心修改结束 ==================
+
         if background.shape[0] == 3 and not self.training:
             background = background.expand(H, W, 3)
 
-        return {
+        # --- 构造最终的输出字典 ---
+        outputs = {
             "rgb": rgb.squeeze(0),  # type: ignore
             "depth": depth_im,  # type: ignore
             "accumulation": alpha.squeeze(0),  # type: ignore
             "background": background,  # type: ignore
         }  # type: ignore
+
+        # 如果渲染了特征，将其加入输出字典
+        if rendered_features is not None:
+            outputs["features"] = rendered_features  # [H, W, feature_dim]
+
+        return outputs
 
     def get_gt_img(self, image: torch.Tensor):
         """Compute groundtruth image with iteration dependent downscale factor for evaluation purpose
@@ -700,6 +791,24 @@ class SplatfactoModel(Model):
             if self.config.mcmc_scale_reg > 0.0:
                 mcmc_scale_reg = self.config.mcmc_scale_reg * torch.abs(torch.exp(self.gauss_params["scales"])).mean()
                 loss_dict["mcmc_scale_reg"] = mcmc_scale_reg
+
+        # ================== 开始新增占位损失代码 ==================
+        # 条件：必须是训练阶段，配置启用，并且 outputs 字典中包含 features
+        if self.training and self.config.use_feature_regularization and "features" in outputs:
+            CONSOLE.print("[yellow]Calculating placeholder regularization loss...")
+            # 这是一个临时的占位损失，确保梯度可以回传到 aux_features
+            # 使用 .mean() 连接计算图，乘以 0.0 确保其值不影响主损失
+            reg_loss_placeholder = outputs["features"].mean() * 0.0
+
+            # 根据配置选择损失名称 (实际计算将在第 3、4 周替换)
+            if self.config.regularizer_type == "dino":
+                loss_dict["reg_loss_placeholder_dino"] = reg_loss_placeholder
+                CONSOLE.print("[yellow]Placeholder DINO loss added (value = 0).")
+            elif self.config.regularizer_type == "vgg":
+                loss_dict["reg_loss_placeholder_vgg"] = reg_loss_placeholder
+                CONSOLE.print("[yellow]Placeholder VGG loss added (value = 0).")
+            # 如果未来有 'none' 选项或其他类型，可以在这里添加分支
+        # ================== 新增占位损失代码结束 ==================
 
         if self.training:
             # Add loss from camera optimizer
